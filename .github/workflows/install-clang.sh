@@ -1,32 +1,74 @@
-#!/bin/bash
-
+#!/usr/bin/env bash
 set -euo pipefail
+shopt -s xpg_echo
 
-if (( $# != 1 )); then
-	echo Script requires one argument - the clang version to be installed
-	exit 1
-fi
+typeset base_url distro_name keyring llvm_apt llvm_stable llvm_ver signing_key \
+  suite uri
+typeset -gx DEBIAN_FRONTEND="noninteractive"
 
-if ! which $CC >/dev/null 2>&1; then
-	case $DISTRO in
-		"ubuntu-22.04") distro_name=jammy;;
-		"ubuntu-20.04") distro_name=focal;;
-		*)
-		echo "Unknown distribution $DISTRO"
-		exit 1
-	esac
-	case $1 in
-		"14" | "15") llvm_version=$1;;
-		*)
-		echo "Unknown llvm version $1"
-		exit 1
-	esac
+base_url="http://apt.llvm.org"
+keyring="/etc/apt/keyrings/llvm.gpg"
+llvm_stable="18"
+signing_key="${base_url}/llvm-snapshot.gpg.key"
 
-	sources="deb [trusted=yes] http://apt.llvm.org/$distro_name/ llvm-toolchain-$distro_name-$llvm_version main"
+sudo apt update || return 0
+sudo apt --yes install gpg lsb-release software-properties-common wget
 
-	echo "clang-$llvm_version missed in the image, installing from llvm"
-	echo "$sources" | sudo tee -a /etc/apt/sources.list
-	sudo apt-get update
-	sudo apt-get install -y --no-install-recommends clang-$llvm_version
-fi
+case "${DISTRO}" in
+  *ubuntu*20.04*)
+    distro_name="focal"
+    ;;
+  *ubuntu*22.04*)
+    distro_name="jammy"
+    ;;
+  *ubuntu*24.04* | *ubuntu*latest)
+    distro_name="noble"
+    ;;
+  *ubuntu*24.10*)
+    distro_name="oracular"
+    ;;
+  *ubuntu*25.04*)
+    distro_name="plucky"
+    ;;
+  *)
+    distro_name="$(lsb_release -cs)"
+esac
 
+case "${1:-$llvm_stable}" in
+  18)
+    llvm_ver="-18"
+    ;;
+  19)
+    llvm_ver="-19"
+    ;;
+  20)
+    llvm_ver=""
+    ;;
+esac
+
+uri="${base_url}/${distro_name}"
+suite="llvm-toolchain-${distro_name}${llvm_ver}"
+llvm_apt="$(cat <<-EOF
+	Enabled: yes
+	Types: deb deb-src
+	Architectures: amd64
+	Signed-By: "${keyring}"
+	URIs: "${uri}"
+	Suites: "${suite}"
+	Components: main
+	EOF
+)"
+
+for dir in keyrings sources.list.d; do
+  [[ -d "/etc/apt/${dir}" ]] || sudo mkdir -pv "/etc/apt/${dir}"
+done
+
+wget -qO- "${signing_key}" | sudo apt-key --keyring "${keyring}" add -
+
+echo "${llvm_apt}" | sudo tee /etc/apt/sources.list.d/llvm.sources
+
+sudo apt update || return 0
+sudo apt --yes install "clang${llvm_ver}" "lld${llvm_ver}" "llvm${llvm_ver}"
+sudo apt --yes full-upgrade
+
+exit 0

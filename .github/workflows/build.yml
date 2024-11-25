@@ -1,0 +1,54 @@
+---
+name: SonarQube Cloud
+on:
+  push:
+    branches:
+      - sonarcube
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  build:
+    name: Build and analyze
+    strategy:
+      matrix:
+        compiler: [clang-18, gcc]
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      APT_PREFS: /etc/apt/preferences.d
+      BUILD_WRAPPER_OUT_DIR: ../analyze_output
+      CC: ${{ matrix.compiler }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+        with:
+          # Shallow clones should be disabled for a better relevancy of analysis
+          fetch-depth: 0
+      - name: 'Install prerequisites'
+        run: |2
+          [[ -d "${APT_PREFS}" ]] || sudo mkdir -pv "${APT_PREFS}"
+          printf '%s\n' 'Package: snapd' 'Pin: release a=*' \
+            'Pin-Priority: -10' | sudo tee /etc/apt/preferences.d/nosnap.pref
+          sudo apt update; sudo apt --autoremove --yes purge firefox snapd
+          sudo apt --yes install g++ gcc libdrm-dev libegl-dev libva-dev \
+            lsb-release meson; sudo apt --yes full-upgrade
+      - name: 'Install LLVM toolchain'
+        if: ${{ (matrix.compiler == 'clang-18') }}
+        run: .github/workflows/install-clang.sh 18
+      - name: Install sonar-scanner and build-wrapper
+        uses: SonarSource/sonarcloud-github-c-cpp@v3
+      - name: 'Configure'
+        run: meson setup ./builddir --prefix=/usr -D werror=true
+      - name: 'Run build-wrapper'
+        run: >2
+          build-wrapper-linux-x86-64 --out-dir ${{ env.BUILD_WRAPPER_OUT_DIR }}
+          meson compile -C ./builddir
+      - name: 'Run sonar-scanner'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: >2
+          sonar-scanner --define
+          sonar.cfamily.compile-commands="${{ env.BUILD_WRAPPER_OUT_DIR }}/compile_commands.json"
+...
