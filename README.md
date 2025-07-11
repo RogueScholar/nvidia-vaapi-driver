@@ -70,8 +70,8 @@ You'll need `meson`, the `gstreamer-plugins-bad` library, and [`nv-codec-headers
 | Package manager | Packages                                        | Optional packages for additional codec support |
 |-----------------|-------------------------------------------------|------------------------------------------------|
 | pacman          | meson gst-plugins-bad ffnvcodec-headers         |                                                |
-| apt             | meson gstreamer1.0-plugins-bad libffmpeg-nvenc-dev libva-dev libegl-dev | libgstreamer-plugins-bad1.0-dev   |
-| yum/dnf         | meson libva-devel gstreamer1-plugins-bad-freeworld nv-codec-headers | gstreamer1-plugins-bad-free-devel |
+| apt             | meson gstreamer1.0-plugins-bad libffmpeg-nvenc-dev libva-dev libegl-dev libdrm-dev | libgstreamer-plugins-bad1.0-dev   |
+| yum/dnf         | meson libva-devel gstreamer1-plugins-bad-freeworld nv-codec-headers libdrm-devel | gstreamer1-plugins-bad-free-devel |
 
 Then run the following commands:
 
@@ -113,7 +113,8 @@ To use the driver with firefox you will need at least Firefox 96, `ffmpeg` compi
 
 | Option | Value | Reason |
 |---|---|---|
-| media.ffmpeg.vaapi.enabled | true | Required, enables the use of VA-API. |
+| media.ffmpeg.vaapi.enabled | true | Required until Firefox 137, enables the use of VA-API. |
+| media.hardware-video-decoding.force-enabled | true | Required since Firefox 137, enables hardware acceleration. |
 | media.rdd-ffmpeg.enabled | true | Required, default on FF97. Forces ffmpeg usage into the RDD process, rather than the content process. |
 | media.av1.enabled | false | Optional, disables AV1. If your GPU doesn't support AV1, this will prevent sites using it and falling back to software decoding. |
 | gfx.x11-egl.force-enabled | true | Required, this driver requires that Firefox use the EGL backend. It may be enabled by default. It is recommended to test it with the `MOZ_X11_EGL=1` environment variable before enabling it in the Firefox configuration. |

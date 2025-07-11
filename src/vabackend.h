@@ -15,6 +15,7 @@
 
 #define SURFACE_QUEUE_SIZE 16
 #define MAX_IMAGE_COUNT 64
+#define MAX_PROFILES 32
 
 typedef struct {
     void        *buf;
@@ -41,10 +42,10 @@ typedef struct Object_t
 typedef struct
 {
     unsigned int    elements;
-    int             size;
+    size_t          size;
     VABufferType    bufferType;
     void            *ptr;
-    int             offset;
+    size_t          offset;
 } NVBuffer;
 
 struct _NVContext;
@@ -67,6 +68,7 @@ typedef struct
     int                     resolving;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
+    bool                    decodeFailed;
 } NVSurface;
 
 typedef enum
@@ -82,8 +84,8 @@ typedef enum
 
 typedef struct
 {
-    int         width;
-    int         height;
+    uint32_t    width;
+    uint32_t    height;
     NVFormat    format;
     NVBuffer    *imageBuffer;
 } NVImage;
@@ -108,8 +110,6 @@ typedef struct _BackingImage {
     //direct backend only
     NVCudaImage cudaImages[3];
     NVFormat    format;
-    uint32_t    totalSize;
-    CUexternalMemory extMem;
 } BackingImage;
 
 struct _NVDriver;
@@ -130,6 +130,7 @@ typedef struct _NVDriver
     CudaFunctions           *cu;
     CuvidFunctions          *cv;
     CUcontext               cudaContext;
+    CUvideoctxlock          vidLock;
     Array/*<Object>*/       objects;
     pthread_mutex_t         objectCreationMutex;
     VAGenericID             nextObjId;
@@ -138,7 +139,6 @@ typedef struct _NVDriver
     bool                    supports444Surface;
     int                     cudaGpuId;
     int                     drmFd;
-    int                     surfaceCount;
     pthread_mutex_t         exportMutex;
     pthread_mutex_t         imagesMutex;
     Array/*<NVEGLImage>*/   images;
@@ -152,6 +152,8 @@ typedef struct _NVDriver
     EGLStreamKHR            eglStream;
     CUeglStreamConnection   cuStreamConnection;
     int                     numFramesPresented;
+    int                     profileCount;
+    VAProfile               profiles[MAX_PROFILES];
 } NVDriver;
 
 struct _NVCodec;
@@ -161,8 +163,8 @@ typedef struct _NVContext
     NVDriver            *drv;
     VAProfile           profile;
     VAEntrypoint        entrypoint;
-    int                 width;
-    int                 height;
+    uint32_t            width;
+    uint32_t            height;
     CUvideodecoder      decoder;
     NVSurface           *renderTarget;
     void                *lastSliceParams;
@@ -178,8 +180,9 @@ typedef struct _NVContext
     NVSurface*          surfaceQueue[SURFACE_QUEUE_SIZE];
     int                 surfaceQueueReadIdx;
     int                 surfaceQueueWriteIdx;
-    bool                exiting;
+    volatile bool       exiting;
     pthread_mutex_t     surfaceCreationMutex;
+    int                 surfaceCount;
 } NVContext;
 
 typedef struct
