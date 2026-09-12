@@ -13,6 +13,8 @@
 #include <sys/sysmacros.h>
 #endif
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
 #include "../backend-common.h"
 
 #include <drm.h>
@@ -317,10 +319,61 @@ static uint64_t backingImageMemorySize(const BackingImage *img) {
     return size;
 }
 
-static bool backingImageCanPrune(const BackingImage *img) {
+static bool backingImageImplicitFencesIdle(const BackingImage *img) {
+    if (img == NULL) {
+        return false;
+    }
+
+    struct pollfd pfds[4];
+    nfds_t nfds = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (img->fds[i] < 0) {
+            continue;
+        }
+
+        pfds[nfds++] = (struct pollfd) {
+            .fd = img->fds[i],
+            .events = POLLOUT,
+        };
+    }
+
+    if (nfds == 0) {
+        return true;
+    }
+
+    // POLLOUT becomes ready once all currently attached implicit
+    // DMA-BUF fences, shared and exclusive, have signaled.
+    int ret;
+    do {
+        ret = poll(pfds, nfds, 0);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret <= 0) {
+        return false;
+    }
+
+    for (nfds_t i = 0; i < nfds; i++) {
+        if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return false;
+        }
+        if ((pfds[i].revents & POLLOUT) == 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool backingImageIsDetachedAndUnborrowed(const BackingImage *img) {
     return img != NULL &&
            img->surface == NULL &&
            atomic_load(&img->borrowCount) == 0;
+}
+
+static bool backingImageCanPrune(const BackingImage *img) {
+    return backingImageIsDetachedAndUnborrowed(img) &&
+           backingImageImplicitFencesIdle(img);
 }
 
 static bool detachedBackingImagesOverLimit(uint64_t bytes, uint32_t count, const NVDriver *drv) {
@@ -371,7 +424,7 @@ static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
     pthread_mutex_lock(&drv->imagesMutex);
 
     ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
-        if (backingImageCanPrune(img)) {
+        if (backingImageIsDetachedAndUnborrowed(img)) {
             bytes += backingImageMemorySize(img);
             count++;
         }
