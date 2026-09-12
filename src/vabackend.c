@@ -1693,6 +1693,8 @@ static VAStatus nvDestroySurfaces(
 
         LOG_DEBUG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
+        waitSurfaceResolved(surface);
+
         drv->backend->detachBackingImageFromSurface(drv, surface);
 
         deleteObject(drv, surface_list[i]);
