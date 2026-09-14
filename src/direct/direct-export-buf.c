@@ -365,6 +365,83 @@ static bool backingImageImplicitFencesIdle(const BackingImage *img) {
     return true;
 }
 
+#ifdef __linux__
+static bool dmaBufFdReferenceCount(int fd, uint64_t *count) {
+    char path[64];
+    int pathLength = snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+    if (pathLength < 0 || (size_t) pathLength >= sizeof(path)) {
+        return false;
+    }
+
+    FILE *fdInfo = fopen(path, "r");
+    if (fdInfo == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    char line[128];
+    while (fgets(line, sizeof(line), fdInfo) != NULL) {
+        unsigned long long value;
+        if (sscanf(line, "count: %llu", &value) == 1) {
+            *count = (uint64_t) value;
+            found = true;
+            break;
+        }
+    }
+    fclose(fdInfo);
+    return found;
+}
+
+static uint32_t backingImageOwnFdReferences(const BackingImage *img, int index) {
+    uint32_t references = 0;
+    for (int i = 0; i < 4; i++) {
+        if (img->fds[i] >= 0 &&
+            img->st_dev[i] == img->st_dev[index] &&
+            img->st_ino[i] == img->st_ino[index]) {
+            references++;
+        }
+    }
+    return references;
+}
+
+static bool backingImageHasExternalDmaBufReferences(const BackingImage *img) {
+    for (int i = 0; i < 4; i++) {
+        if (img->fds[i] < 0) {
+            continue;
+        }
+
+        bool alreadyChecked = false;
+        for (int j = 0; j < i; j++) {
+            if (img->fds[j] >= 0 &&
+                img->st_dev[j] == img->st_dev[i] &&
+                img->st_ino[j] == img->st_ino[i]) {
+                alreadyChecked = true;
+                break;
+            }
+        }
+        if (alreadyChecked) {
+            continue;
+        }
+
+        uint64_t referenceCount;
+        if (dmaBufFdReferenceCount(img->fds[i], &referenceCount)) {
+            uint32_t ownReferences = backingImageOwnFdReferences(img, i);
+            if (referenceCount > ownReferences) {
+                LOG_DEBUG("Keeping detached BackingImage %p: dma-buf fd=%d has %llu references (%u owned)",
+                    img, img->fds[i], (unsigned long long) referenceCount, ownReferences);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#else
+static bool backingImageHasExternalDmaBufReferences(const BackingImage *img) {
+    (void) img;
+    return false;
+}
+#endif
+
 static bool backingImageIsDetachedAndUnborrowed(const BackingImage *img) {
     return img != NULL &&
            img->surface == NULL &&
@@ -373,6 +450,7 @@ static bool backingImageIsDetachedAndUnborrowed(const BackingImage *img) {
 
 static bool backingImageCanPrune(const BackingImage *img) {
     return backingImageIsDetachedAndUnborrowed(img) &&
+           !backingImageHasExternalDmaBufReferences(img) &&
            backingImageImplicitFencesIdle(img);
 }
 
@@ -404,6 +482,7 @@ static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes
 
     BackingImage *img = get_element_at(&drv->images, pruneIndex);
     uint64_t imageBytes = backingImageMemorySize(img);
+    LOG_DEBUG("Pruning detached BackingImage %p with no client dma-buf references", img);
     destroyBackingImage(drv, img);
     remove_element_at(&drv->images, pruneIndex);
     if (*bytes >= imageBytes) {
