@@ -44,9 +44,14 @@ typedef struct {
     NvS32 numaNode;
 } NV_MEMORY_ALLOCATION_PARAMS_545;
 
-_Static_assert(offsetof(NV_MEMORY_ALLOCATION_PARAMS_545, numaNode) ==
-               sizeof(NV_MEMORY_ALLOCATION_PARAMS),
-               "NVIDIA 545 allocation compatibility layout is invalid");
+// Check the wire layout explicitly so a vendored header update cannot silently
+// move numaNode or change the parameter size sent to older drivers.
+_Static_assert(sizeof(NV_MEMORY_ALLOCATION_PARAMS) == 120,
+               "pre-545 NVIDIA allocation parameters must be 120 bytes");
+_Static_assert(offsetof(NV_MEMORY_ALLOCATION_PARAMS_545, numaNode) == 120,
+               "NVIDIA 545 numaNode must be at byte 120");
+_Static_assert(sizeof(NV_MEMORY_ALLOCATION_PARAMS_545) == 128,
+               "NVIDIA 545 allocation parameters must be 128 bytes");
 
 static const NvHandle NULL_OBJECT;
 
@@ -391,7 +396,11 @@ bool init_nvdriver(NVDriverContext *context, const int drmFd) {
 
     //query the version of the api
     char *ver = NULL;
-    nv_get_versions(nvctlFd, &ver);
+    if (!nv_get_versions(nvctlFd, &ver) || ver == NULL) {
+        LOG("Failed to query NVIDIA kernel driver version")
+        free(ver);
+        goto err;
+    }
     context->driverMajorVersion = atoi(ver);
     context->driverMinorVersion = atoi(ver+4);
     LOG("NVIDIA kernel driver version: %s, major version: %d, minor version: %d", ver, context->driverMajorVersion, context->driverMinorVersion)
