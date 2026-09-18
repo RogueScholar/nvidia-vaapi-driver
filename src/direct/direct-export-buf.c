@@ -424,13 +424,28 @@ static bool backingImageHasExternalDmaBufReferences(const BackingImage *img) {
         }
 
         uint64_t referenceCount;
-        if (dmaBufFdReferenceCount(img->fds[i], &referenceCount)) {
-            uint32_t ownReferences = backingImageOwnFdReferences(img, i);
+        if (!dmaBufFdReferenceCount(img->fds[i], &referenceCount)) {
+            // Reference-count visibility is part of the reclamation proof. If
+            // procfs is unavailable (for example inside a client sandbox) or
+            // its fdinfo format cannot be parsed, retain the image rather than
+            // treating an unknown reference count as no external references.
+            LOG_DEBUG("Keeping detached BackingImage %p: unable to read dma-buf fd=%d reference count",
+                img, img->fds[i]);
+            return true;
+        }
+
+        uint32_t ownReferences = backingImageOwnFdReferences(img, i);
+        if (referenceCount != ownReferences) {
             if (referenceCount > ownReferences) {
                 LOG_DEBUG("Keeping detached BackingImage %p: dma-buf fd=%d has %llu references (%u owned)",
                     img, img->fds[i], (unsigned long long) referenceCount, ownReferences);
-                return true;
+            } else {
+                // A count below the FDs tracked by this image is inconsistent;
+                // fail closed instead of using it to authorize destruction.
+                LOG_DEBUG("Keeping detached BackingImage %p: dma-buf fd=%d has inconsistent reference count %llu (%u owned)",
+                    img, img->fds[i], (unsigned long long) referenceCount, ownReferences);
             }
+            return true;
         }
     }
     return false;
@@ -438,7 +453,9 @@ static bool backingImageHasExternalDmaBufReferences(const BackingImage *img) {
 #else
 static bool backingImageHasExternalDmaBufReferences(const BackingImage *img) {
     (void) img;
-    return false;
+    // Without a supported reference-count query, ownership is unknown. Keep
+    // detached images rather than permitting unsafe reclamation.
+    return true;
 }
 #endif
 
