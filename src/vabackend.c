@@ -658,6 +658,20 @@ static void* resolveSurfaces(void *param) {
         CHECK_CUDA_RESULT(cv->cuvidUnmapVideoFrame(ctx->decoder, deviceMemory));
     }
 out:
+    // Clear resolving flag on any surfaces still in the queue so that
+    // waitSurfaceResolved() doesn't hang if called after this thread exits.
+    // This can happen when the context is destroyed while surfaces are still
+    // in the resolve queue, then those surfaces are destroyed afterward.
+    pthread_mutex_lock(&ctx->resolveMutex);
+    while (ctx->surfaceQueueReadIdx != ctx->surfaceQueueWriteIdx) {
+        NVSurface *surface = ctx->surfaceQueue[ctx->surfaceQueueReadIdx++];
+        if (ctx->surfaceQueueReadIdx >= SURFACE_QUEUE_SIZE) {
+            ctx->surfaceQueueReadIdx = 0;
+        }
+        setSurfaceResolving(surface, false);
+    }
+    pthread_mutex_unlock(&ctx->resolveMutex);
+    
     //release the decoder here to prevent multiple threads attempting it
     if (ctx->decoder != NULL) {
         CUresult result = cv->cuvidDestroyDecoder(ctx->decoder);
@@ -1693,7 +1707,25 @@ static VAStatus nvDestroySurfaces(
 
         LOG_DEBUG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
-        waitSurfaceResolved(surface);
+        // Only wait if the surface's context still has a running resolve thread.
+        // If the context was already destroyed, the resolve thread has exited and
+        // will never signal the condition variable, so waiting would hang forever.
+        // In that case, just clear the resolving flag and proceed.
+        if (surface->context != NULL && surface->context->resolveThreadStarted && !surface->context->exiting) {
+            waitSurfaceResolved(surface);
+        } else {
+            // Context destroyed or thread not running - manually clear resolving flag
+            pthread_mutex_lock(&surface->mutex);
+            surface->resolving = 0;
+            pthread_mutex_unlock(&surface->mutex);
+            
+            BackingImage *img = surfaceSyncBackingImage(surface);
+            if (img != NULL && img->syncInitialized) {
+                pthread_mutex_lock(&img->mutex);
+                img->resolving = 0;
+                pthread_mutex_unlock(&img->mutex);
+            }
+        }
 
         drv->backend->detachBackingImageFromSurface(drv, surface);
 
