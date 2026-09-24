@@ -65,7 +65,7 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     int                     pictureIdx;
-    struct _NVContext       *context;
+    VAContextID             contextId; // last decoder context; remains valid as an ID after destruction
     int                     progressiveFrame;
     int                     topFieldFirst;
     int                     secondField;
