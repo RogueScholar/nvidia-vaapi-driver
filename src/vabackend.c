@@ -528,8 +528,10 @@ static bool destroyContext(NVDriver *drv, NVContext *nvCtx) {
         struct timespec timeout;
         clock_gettime(CLOCK_REALTIME, &timeout);
         timeout.tv_sec += 5;
+        pthread_mutex_lock(&nvCtx->resolveMutex);
         nvCtx->exiting = true;
         pthread_cond_signal(&nvCtx->resolveCondition);
+        pthread_mutex_unlock(&nvCtx->resolveMutex);
         LOG("Waiting for resolve thread to exit");
         int ret = pthread_timedjoin_np(nvCtx->resolveThread, NULL, &timeout);
         LOG("Finished waiting for resolve thread with %d", ret);
@@ -614,23 +616,24 @@ static void* resolveSurfaces(void *param) {
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), NULL);
 
     LOG("[RT] Resolve thread for %p started", ctx);
-    while (!ctx->exiting) {
+    for (;;) {
         //wait for frame on queue
         pthread_mutex_lock(&ctx->resolveMutex);
-        while (ctx->surfaceQueueReadIdx == ctx->surfaceQueueWriteIdx) {
+        while (ctx->surfaceQueueReadIdx == ctx->surfaceQueueWriteIdx && !ctx->exiting) {
             pthread_cond_wait(&ctx->resolveCondition, &ctx->resolveMutex);
-            if (ctx->exiting) {
-                pthread_mutex_unlock(&ctx->resolveMutex);
-                goto out;
-            }
         }
-        pthread_mutex_unlock(&ctx->resolveMutex);
-        //find the last item
-        //LOG("Reading from queue: %d %d", ctx->surfaceQueueReadIdx, ctx->surfaceQueueWriteIdx);
+        //A context can be destroyed while FFmpeg still holds decoded frames.
+        //Resolve every queued surface before the decoder is destroyed so those
+        //frames retain their backing images for a later vaGetImage call.
+        if (ctx->surfaceQueueReadIdx == ctx->surfaceQueueWriteIdx) {
+            pthread_mutex_unlock(&ctx->resolveMutex);
+            goto out;
+        }
         NVSurface *surface = ctx->surfaceQueue[ctx->surfaceQueueReadIdx++];
         if (ctx->surfaceQueueReadIdx >= SURFACE_QUEUE_SIZE) {
             ctx->surfaceQueueReadIdx = 0;
         }
+        pthread_mutex_unlock(&ctx->resolveMutex);
 
         CUdeviceptr deviceMemory = (CUdeviceptr) NULL;
         unsigned int pitch = 0;
@@ -671,7 +674,7 @@ out:
         setSurfaceResolving(surface, false);
     }
     pthread_mutex_unlock(&ctx->resolveMutex);
-    
+
     //release the decoder here to prevent multiple threads attempting it
     if (ctx->decoder != NULL) {
         CUresult result = cv->cuvidDestroyDecoder(ctx->decoder);
@@ -1718,7 +1721,7 @@ static VAStatus nvDestroySurfaces(
             pthread_mutex_lock(&surface->mutex);
             surface->resolving = 0;
             pthread_mutex_unlock(&surface->mutex);
-            
+
             BackingImage *img = surfaceSyncBackingImage(surface);
             if (img != NULL && img->syncInitialized) {
                 pthread_mutex_lock(&img->mutex);
@@ -3334,6 +3337,12 @@ static VAStatus nvGetImage(
 
     //wait for the surface to be decoded
     nvSyncSurface(ctx, surface);
+
+    //A failed resolve may leave a surface without an image. Report the decode
+    //failure instead of dereferencing a null backing image in the copy below.
+    if (surfaceObj->backingImage == NULL) {
+        return VA_STATUS_ERROR_DECODING_ERROR;
+    }
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
