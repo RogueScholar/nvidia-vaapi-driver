@@ -482,26 +482,86 @@ static bool detachedBackingImagesOverLimit(uint64_t bytes, uint32_t count, const
            bytes > drv->maxDetachedBackingImageBytes;
 }
 
-static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
-    uint32_t pruneIndex = UINT32_MAX;
-    uint64_t oldestSerial = UINT64_MAX;
+// A candidate for reclamation, ordered by detach age so the oldest goes first.
+typedef struct
+{
+    BackingImage *img;
+    uint64_t      detachedSerial;
+} PruneCandidate;
 
+static void sortPruneCandidatesOldestFirst(PruneCandidate *candidates, uint32_t count) {
+    // Insertion sort: the candidate list is a handful of detached images, and
+    // this keeps the ordering stable and allocation-free.
+    for (uint32_t i = 1; i < count; i++) {
+        PruneCandidate candidate = candidates[i];
+        uint32_t j = i;
+        while (j > 0 && candidates[j - 1].detachedSerial > candidate.detachedSerial) {
+            candidates[j] = candidates[j - 1];
+            j--;
+        }
+        candidates[j] = candidate;
+    }
+}
+
+// Evaluate reclaimability for every image exactly once and return the eligible
+// ones ordered oldest-first.
+//
+// The eligibility test is not cheap: it opens /proc/self/fdinfo once per plane
+// and polls each plane's implicit fence. Re-running it for every image on every
+// iteration of the prune loop made a single prune pass cost O(pruned * images)
+// procfs reads, all of them serialised behind drv->imagesMutex, which every
+// surface realisation also needs. Taking the decision once and then acting on
+// it makes a pass O(images) regardless of how much has to be freed.
+//
+// The candidates are returned as pointers rather than indices because
+// remove_element_at() shifts the array down, invalidating every index we had
+// already collected.
+static uint32_t collectPruneCandidatesLocked(NVDriver *drv, PruneCandidate **out) {
+    *out = NULL;
+
+    if (drv->images.size == 0) {
+        return 0;
+    }
+
+    PruneCandidate *candidates = calloc(drv->images.size, sizeof(PruneCandidate));
+    if (candidates == NULL) {
+        return 0;
+    }
+
+    uint32_t count = 0;
     ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
-        if (backingImageCanPrune(img) && img->detachedSerial < oldestSerial) {
-            pruneIndex = img_idx;
-            oldestSerial = img->detachedSerial;
+        if (backingImageCanPrune(img)) {
+            candidates[count++] = (PruneCandidate) {
+                .img = img,
+                .detachedSerial = img->detachedSerial,
+            };
         }
     END_FOR_EACH
 
-    if (pruneIndex == UINT32_MAX) {
-        return false;
+    sortPruneCandidatesOldestFirst(candidates, count);
+    *out = candidates;
+    return count;
+}
+
+// Remove one already-collected candidate, if it is still in the array. Returns
+// the bytes reclaimed.
+static uint64_t pruneCandidateLocked(NVDriver *drv, BackingImage *img, uint64_t *bytes, uint32_t *count) {
+    uint32_t index = UINT32_MAX;
+    ARRAY_FOR_EACH(BackingImage*, candidate, &drv->images)
+        if (candidate == img) {
+            index = candidate_idx;
+            break;
+        }
+    END_FOR_EACH
+
+    if (index == UINT32_MAX) {
+        return 0;
     }
 
-    BackingImage *img = get_element_at(&drv->images, pruneIndex);
     uint64_t imageBytes = backingImageMemorySize(img);
     LOG_DEBUG("Pruning detached BackingImage %p with no client dma-buf references", img);
     destroyBackingImage(drv, img);
-    remove_element_at(&drv->images, pruneIndex);
+    remove_element_at(&drv->images, index);
     if (*bytes >= imageBytes) {
         *bytes -= imageBytes;
     } else {
@@ -510,7 +570,23 @@ static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes
     if (*count > 0) {
         (*count)--;
     }
-    return true;
+    return imageBytes;
+}
+
+static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
+    PruneCandidate *candidates = NULL;
+    const uint32_t candidateCount = collectPruneCandidatesLocked(drv, &candidates);
+
+    bool pruned = false;
+    for (uint32_t i = 0; i < candidateCount; i++) {
+        if (pruneCandidateLocked(drv, candidates[i].img, bytes, count) > 0) {
+            pruned = true;
+            break;
+        }
+    }
+
+    free(candidates);
+    return pruned;
 }
 
 static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
@@ -526,11 +602,17 @@ static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
         }
     END_FOR_EACH
 
-    while (detachedBackingImagesOverLimit(bytes, count, drv)) {
-        if (!pruneOldestDetachedBackingImageLocked(drv, &bytes, &count)) {
+    // Reclaimability is decided once for the whole pass, then acted on in
+    // oldest-first order until the cache is back under its limits.
+    PruneCandidate *candidates = NULL;
+    const uint32_t candidateCount = collectPruneCandidatesLocked(drv, &candidates);
+    for (uint32_t i = 0; i < candidateCount; i++) {
+        if (!detachedBackingImagesOverLimit(bytes, count, drv)) {
             break;
         }
+        pruneCandidateLocked(drv, candidates[i].img, &bytes, &count);
     }
+    free(candidates);
 
     pthread_mutex_unlock(&drv->imagesMutex);
 }
