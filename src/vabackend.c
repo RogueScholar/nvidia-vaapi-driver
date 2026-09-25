@@ -1981,8 +1981,13 @@ static VAStatus nvDestroyContext(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     LOG("Destroying context: %d", context);
 
-    // A VideoProc blit runs on its caller's thread. Wait for active calls
-    // before clearing its render target and freeing the context.
+    // The lock is held across the whole teardown, for both entrypoints. A
+    // decode context used to drop it before destroyContext(), which left a
+    // window in which a concurrent nvBeginPicture()/nvRenderPicture() could
+    // look the context up and start using it while destroyContext() was freeing
+    // codecData, bitstreamBuffer and sliceOffsets underneath it. The resolve
+    // thread takes resolveMutex but never objectCreationMutex, so joining it
+    // with the lock held cannot deadlock.
     pthread_mutex_lock(&drv->objectCreationMutex);
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
@@ -1992,12 +1997,15 @@ static VAStatus nvDestroyContext(
     }
 
     if (nvCtx->entrypoint != VAEntrypointVideoProc) {
-        pthread_mutex_unlock(&drv->objectCreationMutex);
         if (!destroyContext(nvCtx)) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
+        // The resolver has joined, so nothing can be mid-resolve on these
+        // surfaces any more; release anyone still waiting on them.
         finishContextSurfaces(drv, context);
         deleteObject(drv, context);
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_SUCCESS;
     }
 
