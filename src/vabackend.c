@@ -1647,6 +1647,41 @@ static void detachBackingImageFromSurface(NVDriver *drv, NVSurface *surface) {
     drv->backend->detachBackingImageFromSurface(drv, surface);
 }
 
+// The activeVideoProcCalls counter keeps a VideoProc *context* alive across
+// vaDestroyContext(), but nothing kept its *surfaces* alive: nvRenderPicture()
+// resolves pipeline->surface to an NVSurface and copySurfaceBackingImage() then
+// dereferences it (src->backingImage, src->progressiveFrame, the colour metadata,
+// and a full CUDA copy) with no pin. A vaDestroySurfaces() racing that blit
+// freed the surface and detached the backing image the copy was reading.
+static void surfaceAcquireVideoProcRead(NVSurface *surface) {
+    if (surface != NULL) {
+        atomic_fetch_add(&surface->videoProcReads, 1);
+    }
+}
+
+static void surfaceReleaseVideoProcRead(NVSurface *surface) {
+    if (surface == NULL) {
+        return;
+    }
+    if (atomic_fetch_sub(&surface->videoProcReads, 1) == 1) {
+        pthread_mutex_lock(&surface->mutex);
+        pthread_cond_broadcast(&surface->cond);
+        pthread_mutex_unlock(&surface->mutex);
+    }
+}
+
+static void waitSurfaceUnusedByVideoProc(NVSurface *surface) {
+    if (surface == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&surface->mutex);
+    while (atomic_load(&surface->videoProcReads) != 0) {
+        pthread_cond_wait(&surface->cond, &surface->mutex);
+    }
+    pthread_mutex_unlock(&surface->mutex);
+}
+
 static VAStatus nvCreateSurfaces2(
             VADriverContextP    ctx,
             unsigned int        format,
@@ -1806,6 +1841,10 @@ static VAStatus nvDestroySurfaces(
         }
 
         LOG_DEBUG("Destroying surface %d (%p)", surface->pictureIdx, surface);
+
+        // A VideoProc blit may still be reading this surface; let it finish
+        // before the backing image is detached.
+        waitSurfaceUnusedByVideoProc(surface);
 
         detachBackingImageFromSurface(drv, surface);
 
@@ -3123,6 +3162,9 @@ static VAStatus nvRenderPicture(
         nvCtx->activeVideoProcCalls++;
         nvCtx->activeVideoProcRenders++;
         NVSurface *renderTarget = nvCtx->renderTarget;
+        // Pin the render target for the whole blit so a concurrent
+        // vaDestroySurfaces() waits instead of freeing it mid-copy.
+        surfaceAcquireVideoProcRead(renderTarget);
         pthread_mutex_unlock(&drv->objectCreationMutex);
         VAStatus status = VA_STATUS_SUCCESS;
         bool processed = false;
@@ -3137,9 +3179,12 @@ static VAStatus nvRenderPicture(
             processed = true;
             VAProcPipelineParameterBuffer *pipeline = (VAProcPipelineParameterBuffer*) buf->ptr;
             NVSurface *src = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, pipeline->surface);
+            surfaceAcquireVideoProcRead(src);
             // copySurfaceBackingImage always clears the render target's resolving
             // flag, on both success and every failure path.
-            if (!copySurfaceBackingImage(drv, src, renderTarget, pipeline)) {
+            const bool copied = copySurfaceBackingImage(drv, src, renderTarget, pipeline);
+            surfaceReleaseVideoProcRead(src);
+            if (!copied) {
                 status = VA_STATUS_ERROR_OPERATION_FAILED;
                 break;
             }
@@ -3151,6 +3196,7 @@ static VAStatus nvRenderPicture(
             setSurfaceResolving(renderTarget, false);
         }
 
+        surfaceReleaseVideoProcRead(renderTarget);
         endVideoProcCall(drv, nvCtx, true);
         return status;
     }

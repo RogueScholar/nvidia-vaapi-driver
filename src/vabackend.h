@@ -74,6 +74,12 @@ typedef struct
     bool                    colorRangeFull;
     struct _BackingImage    *backingImage;
     int                     resolving;
+    // Number of in-flight vaRenderPicture() blits currently reading this
+    // surface as a source or writing it as the render target. vaDestroySurfaces()
+    // waits for this to drain before detaching the backing image, so a client
+    // that destroys a surface while a VideoProc blit is still using it cannot
+    // pull the memory out from under the copy.
+    atomic_uint             videoProcReads;
     int                     fourcc;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
