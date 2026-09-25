@@ -543,9 +543,8 @@ static uint32_t collectPruneCandidatesLocked(NVDriver *drv, PruneCandidate **out
     return count;
 }
 
-// Remove one already-collected candidate, if it is still in the array. Returns
-// the bytes reclaimed.
-static uint64_t pruneCandidateLocked(NVDriver *drv, BackingImage *img, uint64_t *bytes, uint32_t *count) {
+// Remove one already-collected candidate, if it is still in the array.
+static bool pruneCandidateLocked(NVDriver *drv, BackingImage *img, uint64_t *bytes, uint32_t *count) {
     uint32_t index = UINT32_MAX;
     ARRAY_FOR_EACH(BackingImage*, candidate, &drv->images)
         if (candidate == img) {
@@ -555,7 +554,7 @@ static uint64_t pruneCandidateLocked(NVDriver *drv, BackingImage *img, uint64_t 
     END_FOR_EACH
 
     if (index == UINT32_MAX) {
-        return 0;
+        return false;
     }
 
     uint64_t imageBytes = backingImageMemorySize(img);
@@ -570,16 +569,34 @@ static uint64_t pruneCandidateLocked(NVDriver *drv, BackingImage *img, uint64_t 
     if (*count > 0) {
         (*count)--;
     }
-    return imageBytes;
+    return true;
+}
+
+// Memory pressure can make candidate allocation fail precisely when the
+// allocation retry needs to free an image. Keep an allocation-free path for
+// that case; its extra scans are preferable to losing reclamation entirely.
+static bool pruneOldestWithoutCandidatesLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
+    BackingImage *oldest = NULL;
+    uint64_t oldestSerial = UINT64_MAX;
+    ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
+        if (backingImageCanPrune(img) && img->detachedSerial < oldestSerial) {
+            oldest = img;
+            oldestSerial = img->detachedSerial;
+        }
+    END_FOR_EACH
+    return oldest != NULL && pruneCandidateLocked(drv, oldest, bytes, count);
 }
 
 static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
     PruneCandidate *candidates = NULL;
     const uint32_t candidateCount = collectPruneCandidatesLocked(drv, &candidates);
+    if (candidates == NULL && drv->images.size != 0) {
+        return pruneOldestWithoutCandidatesLocked(drv, bytes, count);
+    }
 
     bool pruned = false;
     for (uint32_t i = 0; i < candidateCount; i++) {
-        if (pruneCandidateLocked(drv, candidates[i].img, bytes, count) > 0) {
+        if (pruneCandidateLocked(drv, candidates[i].img, bytes, count)) {
             pruned = true;
             break;
         }
@@ -602,10 +619,21 @@ static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
         }
     END_FOR_EACH
 
+    if (!detachedBackingImagesOverLimit(bytes, count, drv)) {
+        pthread_mutex_unlock(&drv->imagesMutex);
+        return;
+    }
+
     // Reclaimability is decided once for the whole pass, then acted on in
     // oldest-first order until the cache is back under its limits.
     PruneCandidate *candidates = NULL;
     const uint32_t candidateCount = collectPruneCandidatesLocked(drv, &candidates);
+    if (candidates == NULL && drv->images.size != 0) {
+        while (detachedBackingImagesOverLimit(bytes, count, drv) &&
+               pruneOldestWithoutCandidatesLocked(drv, &bytes, &count)) {}
+        pthread_mutex_unlock(&drv->imagesMutex);
+        return;
+    }
     for (uint32_t i = 0; i < candidateCount; i++) {
         if (!detachedBackingImagesOverLimit(bytes, count, drv)) {
             break;
