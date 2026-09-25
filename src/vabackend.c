@@ -591,9 +591,10 @@ static bool destroyContext(NVContext *nvCtx) {
 
     freeBuffer(&nvCtx->sliceOffsets);
     freeBuffer(&nvCtx->bitstreamBuffer);
-    if (nvCtx->entrypoint == VAEntrypointVideoProc) {
-        pthread_cond_destroy(&nvCtx->videoProcCondition);
-    }
+    // videoProcCondition is initialised for every context, so destroy it for
+    // every context. Destroying it only for VideoProc entries leaked one
+    // condition variable per decode context.
+    pthread_cond_destroy(&nvCtx->videoProcCondition);
 
     return true;
 }
@@ -1893,6 +1894,8 @@ static VAStatus nvCreateContext(
 
         pthread_mutex_init(&nvCtx->resolveMutex, NULL);
         pthread_cond_init(&nvCtx->resolveCondition, NULL);
+        // Initialised for every context, and destroyContext() now destroys it
+        // for every context, so the two stay symmetric.
         pthread_cond_init(&nvCtx->videoProcCondition, NULL);
 
         *context = contextObj->id;
@@ -3267,7 +3270,12 @@ static VAStatus nvEndPicture(
         setSurfaceResolving(nvCtx->renderTarget, false);
     }
 
+    // contextId is read under objectCreationMutex by finishContextSurfacesLocked()
+    // and nvBeginPicture(), so write it the same way. The surrounding field
+    // updates are guarded by surface->mutex further down and stay as they are.
+    pthread_mutex_lock(&drv->objectCreationMutex);
     surface->contextId = context;
+    pthread_mutex_unlock(&drv->objectCreationMutex);
     surface->topFieldFirst = !picParams->bottom_field_flag;
     surface->secondField = picParams->second_field;
     surface->decodeFailed = status != VA_STATUS_SUCCESS;
