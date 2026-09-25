@@ -99,6 +99,11 @@ FILE *nvStatsOutput(void) {
 // their resolution); the byte ceiling is a safety net so those N frames
 // can't pin an outsized share of a small card's VRAM.
 static const uint64_t DEFAULT_MAX_DETACHED_BACKING_IMAGE_BYTES = 128ULL * 1024ULL * 1024ULL;
+// How many 5s windows destroyContext() waits for a resolve thread to exit. The
+// thread drains its queue before exiting, so one window can be too short on a
+// loaded GPU; giving up means nvTerminate() has to abandon the whole driver
+// instance, which is a far worse outcome than waiting a little longer.
+#define RESOLVE_THREAD_JOIN_ATTEMPTS 6
 static const uint64_t MIN_DYNAMIC_DETACHED_BACKING_IMAGE_BYTES = 64ULL * 1024ULL * 1024ULL;
 static const uint64_t MAX_DYNAMIC_DETACHED_BACKING_IMAGE_BYTES = 512ULL * 1024ULL * 1024ULL;
 static const uint32_t DEFAULT_MAX_DETACHED_BACKING_IMAGES = 16;
@@ -547,9 +552,25 @@ static bool destroyContext(NVContext *nvCtx) {
         nvCtx->exiting = true;
         pthread_cond_signal(&nvCtx->resolveCondition);
         pthread_mutex_unlock(&nvCtx->resolveMutex);
-        LOG("Waiting for resolve thread to exit");
-        int ret = pthread_timedjoin_np(nvCtx->resolveThread, NULL, &timeout);
-        LOG("Finished waiting for resolve thread with %d", ret);
+
+        // The thread now drains whatever is still queued before it exits, so a
+        // single 5s wait can be shorter than the remaining work on a loaded
+        // GPU. Give it several attempts: bailing out here is expensive, because
+        // nvTerminate() cannot free anything while the thread is still running
+        // and has to abandon the whole driver instance instead.
+        int ret;
+        int attempts = 0;
+        do {
+            LOG("Waiting for resolve thread to exit");
+            ret = pthread_timedjoin_np(nvCtx->resolveThread, NULL, &timeout);
+            if (ret != 0) {
+                clock_gettime(CLOCK_REALTIME, &timeout);
+                timeout.tv_sec += 5;
+            }
+            attempts++;
+        } while (ret != 0 && attempts < RESOLVE_THREAD_JOIN_ATTEMPTS);
+
+        LOG("Finished waiting for resolve thread with %d after %d attempt(s)", ret, attempts);
         if (ret != 0) {
             // Keep the context and its buffers alive while the resolver may
             // still be using them. A later destroy attempt can retry the join.
@@ -4012,7 +4033,17 @@ static VAStatus nvTerminate( VADriverContextP ctx )
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
 
+    // A resolver thread that refuses to join leaves live objects behind. We
+    // must NOT continue into the cleanup below: the thread still dereferences
+    // drv->cudaContext, drv->backend, drv->images and the exporter's DRM FD, so
+    // releaseExporter()/cuCtxDestroy()/free(drv) would be a use-after-free.
+    // Abandoning the instance is the safe outcome; destroyContext() retries the
+    // join so that reaching this is not a transient-drain accident. The cost is
+    // that `instances` is not decremented, so the process eventually stops
+    // being able to initialise a new driver instance.
     if (!deleteAllObjects(drv)) {
+        LOG("Abandoning driver instance: a resolve thread did not shut down, "
+            "%zu object(s) still live", (size_t) drv->objects.size);
         CHECK_CUDA_RESULT(cu->cuCtxPopCurrent(NULL));
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
