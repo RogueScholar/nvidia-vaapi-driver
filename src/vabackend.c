@@ -563,19 +563,54 @@ static bool destroyContext(NVContext *nvCtx) {
 
     freeBuffer(&nvCtx->sliceOffsets);
     freeBuffer(&nvCtx->bitstreamBuffer);
+    if (nvCtx->entrypoint == VAEntrypointVideoProc) {
+        pthread_cond_destroy(&nvCtx->videoProcCondition);
+    }
 
     return true;
+}
+
+// Called with objectCreationMutex held. A VideoProc call can wait for a source
+// produced by another context, so it must not hold that mutex while running.
+static void finishVideoProcCalls(NVDriver *drv, NVContext *nvCtx, VAContextID context) {
+    if (nvCtx->entrypoint != VAEntrypointVideoProc) {
+        return;
+    }
+    nvCtx->videoProcDestroying = true;
+    // Let an active blit finish before clearing its target. Then wake any
+    // BeginPicture call waiting for an earlier, unrendered VideoProc picture.
+    while (nvCtx->activeVideoProcRenders != 0) {
+        pthread_cond_wait(&nvCtx->videoProcCondition, &drv->objectCreationMutex);
+    }
+    finishContextSurfaces(drv, context);
+    while (nvCtx->activeVideoProcCalls != 0) {
+        pthread_cond_wait(&nvCtx->videoProcCondition, &drv->objectCreationMutex);
+    }
+}
+
+static void endVideoProcCall(NVDriver *drv, NVContext *nvCtx, bool rendered) {
+    pthread_mutex_lock(&drv->objectCreationMutex);
+    if (rendered) {
+        nvCtx->activeVideoProcRenders--;
+    }
+    nvCtx->activeVideoProcCalls--;
+    pthread_cond_broadcast(&nvCtx->videoProcCondition);
+    pthread_mutex_unlock(&drv->objectCreationMutex);
 }
 
 static bool deleteAllObjects(NVDriver *drv) {
     pthread_mutex_lock(&drv->objectCreationMutex);
     ARRAY_FOR_EACH(Object, o, &drv->objects)
         if (o->type == OBJECT_TYPE_CONTEXT) {
-            if (!destroyContext((NVContext*) o->obj)) {
+            NVContext *nvCtx = (NVContext*) o->obj;
+            finishVideoProcCalls(drv, nvCtx, o->id);
+            if (!destroyContext(nvCtx)) {
                 pthread_mutex_unlock(&drv->objectCreationMutex);
                 return false;
             }
-            finishContextSurfaces(drv, o->id);
+            if (nvCtx->entrypoint != VAEntrypointVideoProc) {
+                finishContextSurfaces(drv, o->id);
+            }
         }
     END_FOR_EACH
 
@@ -1791,6 +1826,7 @@ static VAStatus nvCreateContext(
 
         pthread_mutex_init(&nvCtx->resolveMutex, NULL);
         pthread_cond_init(&nvCtx->resolveCondition, NULL);
+        pthread_cond_init(&nvCtx->videoProcCondition, NULL);
 
         *context = contextObj->id;
         return VA_STATUS_SUCCESS;
@@ -1924,18 +1960,38 @@ static VAStatus nvDestroyContext(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     LOG("Destroying context: %d", context);
 
+    // A VideoProc blit runs on its caller's thread. Wait for active calls
+    // before clearing its render target and freeing the context.
+    pthread_mutex_lock(&drv->objectCreationMutex);
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
     if (nvCtx == NULL) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
+    if (nvCtx->entrypoint != VAEntrypointVideoProc) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+        if (!destroyContext(nvCtx)) {
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        finishContextSurfaces(drv, context);
+        deleteObject(drv, context);
+        return VA_STATUS_SUCCESS;
+    }
+
+    if (nvCtx->videoProcDestroying) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+        return VA_STATUS_ERROR_INVALID_CONTEXT;
+    }
+    finishVideoProcCalls(drv, nvCtx, context);
     if (!destroyContext(nvCtx)) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    finishContextSurfaces(drv, context);
     deleteObject(drv, context);
+    pthread_mutex_unlock(&drv->objectCreationMutex);
 
     return VA_STATUS_SUCCESS;
 }
@@ -2907,7 +2963,6 @@ static bool copySurfaceBackingImage(NVDriver *drv, NVSurface *src, NVSurface *ds
 
 done:
     pthread_mutex_lock(&dst->mutex);
-    dst->contextId = src->contextId;
     dst->progressiveFrame = src->progressiveFrame;
     dst->topFieldFirst = src->topFieldFirst;
     dst->secondField = src->secondField;
@@ -2929,23 +2984,42 @@ static VAStatus nvBeginPicture(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    pthread_mutex_lock(&drv->objectCreationMutex);
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
     NVSurface *surface = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, render_target);
 
     if (nvCtx == NULL) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
     if (surface == NULL) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
 
     if (nvCtx->entrypoint == VAEntrypointVideoProc) {
+        if (nvCtx->videoProcDestroying) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        nvCtx->activeVideoProcCalls++;
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         waitSurfaceResolved(surface);
+        pthread_mutex_lock(&drv->objectCreationMutex);
+        if (nvCtx->videoProcDestroying) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            endVideoProcCall(drv, nvCtx, false);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        surface->contextId = context;
         setSurfaceResolving(surface, true);
         nvCtx->renderTarget = surface;
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+        endVideoProcCall(drv, nvCtx, false);
         return VA_STATUS_SUCCESS;
     }
+    pthread_mutex_unlock(&drv->objectCreationMutex);
 
     if (surface->contextId != VA_INVALID_ID && surface->contextId != context) {
         // The old resolver may still be using the surface even if it has not
@@ -2997,13 +3071,24 @@ static VAStatus nvRenderPicture(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    pthread_mutex_lock(&drv->objectCreationMutex);
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
     if (nvCtx == NULL) {
+        pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
 
     if (nvCtx->entrypoint == VAEntrypointVideoProc) {
+        if (nvCtx->videoProcDestroying) {
+            pthread_mutex_unlock(&drv->objectCreationMutex);
+            return VA_STATUS_ERROR_INVALID_CONTEXT;
+        }
+        nvCtx->activeVideoProcCalls++;
+        nvCtx->activeVideoProcRenders++;
+        NVSurface *renderTarget = nvCtx->renderTarget;
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+        VAStatus status = VA_STATUS_SUCCESS;
         bool processed = false;
         for (int i = 0; i < num_buffers; i++) {
             NVBuffer *buf = (NVBuffer*) getObjectPtr(drv, OBJECT_TYPE_BUFFER, buffers[i]);
@@ -3018,19 +3103,22 @@ static VAStatus nvRenderPicture(
             NVSurface *src = (NVSurface*) getObjectPtr(drv, OBJECT_TYPE_SURFACE, pipeline->surface);
             // copySurfaceBackingImage always clears the render target's resolving
             // flag, on both success and every failure path.
-            if (!copySurfaceBackingImage(drv, src, nvCtx->renderTarget, pipeline)) {
-                return VA_STATUS_ERROR_OPERATION_FAILED;
+            if (!copySurfaceBackingImage(drv, src, renderTarget, pipeline)) {
+                status = VA_STATUS_ERROR_OPERATION_FAILED;
+                break;
             }
         }
 
         // If no pipeline buffer touched the render target, it was still marked
         // resolving in nvBeginPicture; clear it so vaSyncSurface can't hang.
         if (!processed) {
-            setSurfaceResolving(nvCtx->renderTarget, false);
+            setSurfaceResolving(renderTarget, false);
         }
 
-        return VA_STATUS_SUCCESS;
+        endVideoProcCall(drv, nvCtx, true);
+        return status;
     }
+    pthread_mutex_unlock(&drv->objectCreationMutex);
 
     CUVIDPICPARAMS *picParams = &nvCtx->pPicParams;
 
@@ -3057,11 +3145,15 @@ static VAStatus nvEndPicture(
     )
 {
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
+    pthread_mutex_lock(&drv->objectCreationMutex);
     NVContext *nvCtx = (NVContext*) getObjectPtr(drv, OBJECT_TYPE_CONTEXT, context);
 
     if (nvCtx != NULL && nvCtx->entrypoint == VAEntrypointVideoProc) {
-        return VA_STATUS_SUCCESS;
+        bool destroying = nvCtx->videoProcDestroying;
+        pthread_mutex_unlock(&drv->objectCreationMutex);
+        return destroying ? VA_STATUS_ERROR_INVALID_CONTEXT : VA_STATUS_SUCCESS;
     }
+    pthread_mutex_unlock(&drv->objectCreationMutex);
 
     if (nvCtx == NULL || nvCtx->decoder == NULL) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;

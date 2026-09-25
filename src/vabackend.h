@@ -65,7 +65,7 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     int                     pictureIdx;
-    VAContextID             contextId; // last decoder context; remains valid as an ID after destruction
+    VAContextID             contextId; // last context to use this target; remains valid as an ID after destruction
     int                     progressiveFrame;
     int                     topFieldFirst;
     int                     secondField;
@@ -243,6 +243,10 @@ typedef struct _NVContext
     bool                resolveThreadStarted;
     pthread_mutex_t     resolveMutex;
     pthread_cond_t      resolveCondition;
+    pthread_cond_t      videoProcCondition; // protected by drv->objectCreationMutex
+    unsigned int        activeVideoProcCalls;
+    unsigned int        activeVideoProcRenders;
+    bool                videoProcDestroying;
     NVSurface*          surfaceQueue[SURFACE_QUEUE_SIZE];
     int                 surfaceQueueReadIdx;
     int                 surfaceQueueWriteIdx;
