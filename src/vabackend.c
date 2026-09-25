@@ -503,10 +503,18 @@ static Object getObjectByPtr(NVDriver *drv, ObjectType type, void *ptr) {
 
 static void setSurfaceResolving(NVSurface *surface, bool resolving);
 
-static void finishContextSurfaces(NVDriver *drv, VAContextID context) {
+// Requires drv->objectCreationMutex to be held by the caller.
+//
+// This used to take the lock itself, but every caller already held it, so the
+// nested acquisition only worked because objectCreationMutex is
+// PTHREAD_MUTEX_RECURSIVE. Make that mutex an ordinary one and the next
+// self-deadlock would hang a vaDestroyContext/vaTerminate. Naming the
+// requirement and keeping the body lock-free makes the constraint visible and
+// keeps the function usable if the mutex type is ever changed. deleteObject()
+// below has the same contract.
+static void finishContextSurfacesLocked(NVDriver *drv, VAContextID context) {
     // A resolver can exit without publishing a frame. Once it has joined,
     // release every remaining waiter through the normal condition broadcasts.
-    pthread_mutex_lock(&drv->objectCreationMutex);
     ARRAY_FOR_EACH(Object, o, &drv->objects)
         if (o->type == OBJECT_TYPE_SURFACE) {
             NVSurface *surface = (NVSurface*) o->obj;
@@ -515,7 +523,6 @@ static void finishContextSurfaces(NVDriver *drv, VAContextID context) {
             }
         }
     END_FOR_EACH
-    pthread_mutex_unlock(&drv->objectCreationMutex);
 }
 
 static void deleteObject(NVDriver *drv, VAGenericID id) {
@@ -603,7 +610,7 @@ static void finishVideoProcCalls(NVDriver *drv, NVContext *nvCtx, VAContextID co
     while (nvCtx->activeVideoProcRenders != 0) {
         pthread_cond_wait(&nvCtx->videoProcCondition, &drv->objectCreationMutex);
     }
-    finishContextSurfaces(drv, context);
+    finishContextSurfacesLocked(drv, context);
     while (nvCtx->activeVideoProcCalls != 0) {
         pthread_cond_wait(&nvCtx->videoProcCondition, &drv->objectCreationMutex);
     }
@@ -630,7 +637,7 @@ static bool deleteAllObjects(NVDriver *drv) {
                 return false;
             }
             if (nvCtx->entrypoint != VAEntrypointVideoProc) {
-                finishContextSurfaces(drv, o->id);
+                finishContextSurfacesLocked(drv, o->id);
             }
         }
     END_FOR_EACH
@@ -2003,7 +2010,7 @@ static VAStatus nvDestroyContext(
         }
         // The resolver has joined, so nothing can be mid-resolve on these
         // surfaces any more; release anyone still waiting on them.
-        finishContextSurfaces(drv, context);
+        finishContextSurfacesLocked(drv, context);
         deleteObject(drv, context);
         pthread_mutex_unlock(&drv->objectCreationMutex);
         return VA_STATUS_SUCCESS;
