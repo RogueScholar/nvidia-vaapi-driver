@@ -329,15 +329,15 @@ bool get_device_uuid(const NVDriverContext *context, uint8_t uuid[16]) {
                  NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID_FLAGS_TYPE_SHA1
     };
     const int ret = nv_rm_control(context->nvctlFd, context->clientObject, context->clientObject, NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID, 0, sizeof(uuidParams), &uuidParams);
-    if (ret) {
-        return false;
+    if (ret == 1) {
+        for (int i = 0; i < 16; i++) {
+            uuid[i] = uuidParams.gpuUuid[i];
+        }
+
+        return true;
     }
 
-    for (int i = 0; i < 16; i++) {
-        uuid[i] = uuidParams.gpuUuid[i];
-    }
-
-    return true;
+    return false;
 }
 
 // Query memory architecture via RM control.
