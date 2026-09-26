@@ -65,7 +65,7 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     int                     pictureIdx;
-    struct _NVContext       *context;
+    VAContextID             contextId; // last context to use this target; remains valid as an ID after destruction
     int                     progressiveFrame;
     int                     topFieldFirst;
     int                     secondField;
@@ -74,6 +74,15 @@ typedef struct
     bool                    colorRangeFull;
     struct _BackingImage    *backingImage;
     int                     resolving;
+    // Number of in-flight vaRenderPicture() blits currently reading this
+    // surface as a source or writing it as the render target. vaDestroySurfaces()
+    // waits for this to drain before detaching the backing image, so a client
+    // that destroys a surface while a VideoProc blit is still using it cannot
+    // pull the memory out from under the copy.
+    atomic_uint             videoProcReads;
+    // Protected by drv->objectCreationMutex. Once set, VideoProc calls may
+    // no longer take a new read reference to this surface.
+    bool                    destroying;
     int                     fourcc;
     pthread_mutex_t         mutex;
     pthread_cond_t          cond;
@@ -243,6 +252,12 @@ typedef struct _NVContext
     bool                resolveThreadStarted;
     pthread_mutex_t     resolveMutex;
     pthread_cond_t      resolveCondition;
+    pthread_cond_t      videoProcCondition; // protected by drv->objectCreationMutex
+    unsigned int        activeVideoProcCalls;
+    unsigned int        activeVideoProcRenders;
+    bool                videoProcDestroying;
+    unsigned int        activeDecodeCalls; // protected by drv->objectCreationMutex
+    bool                decodeDestroying;
     NVSurface*          surfaceQueue[SURFACE_QUEUE_SIZE];
     int                 surfaceQueueReadIdx;
     int                 surfaceQueueWriteIdx;
